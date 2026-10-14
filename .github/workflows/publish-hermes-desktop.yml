@@ -128,7 +128,11 @@ jobs:
         working-directory: hermes-agent
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run builder --workspace apps/desktop -- --linux AppImage --x64
+        # No --x64: with an explicit arch, upstream's wrapper (v0.21+) stages
+        # into build/native-deps-linux-x64, which its own output guard rejects.
+        # Without one it targets the runner's arch (x64) and reuses the
+        # build/native-deps tree the build step already staged.
+        run: npm run builder --workspace apps/desktop -- --linux AppImage
 
       - name: Verify and stage release files
         if: steps.source.outputs.release_exists != 'true'
