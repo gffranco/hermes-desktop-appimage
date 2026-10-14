@@ -123,6 +123,17 @@ jobs:
             npm run build --workspace apps/desktop
           node -e 'const fs=require("node:fs");const p="apps/desktop/build/install-stamp.json";const s=JSON.parse(fs.readFileSync(p,"utf8"));if(s.commit!==process.env.HERMES_SOURCE_SHA){throw new Error(`Install stamp ${s.commit} does not match Hermes ${process.env.HERMES_SOURCE_SHA}`)};console.log("Verified build-stage install stamp:",JSON.stringify(s))'
 
+      # Upstream copies electron-builder's CommonJS toolsets (icon-tool.js)
+      # under apps/desktop, whose package.json says "type": "module", so Node
+      # loads them as ESM and require() fails. Only the toolset subdirectories
+      # are recreated per run, so a package.json in their parent survives.
+      - name: Load prepared packaging toolsets as CommonJS
+        if: steps.source.outputs.release_exists != 'true'
+        working-directory: hermes-agent
+        run: |
+          mkdir -p apps/desktop/build/prepared-packaging-tools
+          printf '{ "type": "commonjs" }\n' > apps/desktop/build/prepared-packaging-tools/package.json
+
       - name: Package only Linux x86-64 AppImage
         if: steps.source.outputs.release_exists != 'true'
         working-directory: hermes-agent
