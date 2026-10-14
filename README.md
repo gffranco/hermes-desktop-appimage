@@ -29,7 +29,7 @@ release without embedding credentials or a private URL.
 Use these update-source settings:
 
 - Manager: `GithubUpdater`
-- Repository: `HugoUiMBW/hermes-desktop-appimage`
+- Repository: `gffranco/hermes-desktop-appimage`
 - Release filename: `Hermes-Desktop-x86_64.AppImage`
 - Pre-releases: disabled
 
