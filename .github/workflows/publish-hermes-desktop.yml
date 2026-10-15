@@ -19,10 +19,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-linux-appimage:
-    name: Linux x86-64 AppImage release
+  resolve:
+    name: Resolve release and missing variants
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 10
+    outputs:
+      hermes_ref: ${{ steps.source.outputs.hermes_ref }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      release_exists: ${{ steps.source.outputs.release_exists }}
+      matrix: ${{ steps.source.outputs.matrix }}
 
     steps:
       - name: Resolve latest stable Hermes release
@@ -55,33 +60,62 @@ jobs:
 
           release_tag="desktop-$hermes_ref"
           release_exists=false
+          assets='[]'
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             release_exists=true
+            assets="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json assets -q '[.assets[].name]')"
           fi
+
+          # The full app bootstraps a local agent; Light is upstream's
+          # remote-only client (HERMES_DESKTOP_VARIANT=light). Build only the
+          # variants this release does not carry yet, so adding a variant
+          # backfills the current release instead of rebuilding it.
+          matrix="$(
+            jq -cn --argjson assets "$assets" '[
+              { variant: "full", desktop_variant: "", payload: "bootstrap",
+                name: "Hermes-Desktop" },
+              { variant: "light", desktop_variant: "light", payload: "light",
+                name: "Hermes-Light" }
+            ] | map(select((.name + "-x86_64.AppImage") as $file | $assets | index($file) | not))'
+          )"
 
           printf 'Hermes release: %s\n' "$hermes_ref"
           printf 'Downstream release: %s\n' "$release_tag"
           printf 'Already published: %s\n' "$release_exists"
+          printf 'Variants to build: %s\n' "$matrix"
           printf 'hermes_ref=%s\n' "$hermes_ref" >> "$GITHUB_OUTPUT"
           printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
           printf 'release_exists=%s\n' "$release_exists" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
 
+  build:
+    name: Linux x86-64 AppImage (${{ matrix.variant }})
+    needs: resolve
+    if: needs.resolve.outputs.matrix != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    env:
+      HERMES_DESKTOP_VARIANT: ${{ matrix.desktop_variant }}
+
+    steps:
       - name: Check out official Hermes source
-        if: steps.source.outputs.release_exists != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
-          ref: ${{ steps.source.outputs.hermes_ref }}
+          ref: ${{ needs.resolve.outputs.hermes_ref }}
           path: hermes-agent
           fetch-depth: 1
           persist-credentials: false
 
       - name: Record resolved Hermes commit
-        if: steps.source.outputs.release_exists != 'true'
         id: hermes_source
         working-directory: hermes-agent
         env:
-          REQUESTED_REF: ${{ steps.source.outputs.hermes_ref }}
+          REQUESTED_REF: ${{ needs.resolve.outputs.hermes_ref }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
@@ -90,7 +124,6 @@ jobs:
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js required by Hermes
-        if: steps.source.outputs.release_exists != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.11.0"
@@ -98,25 +131,23 @@ jobs:
           cache-dependency-path: hermes-agent/package-lock.json
 
       - name: Install Desktop workspace dependencies
-        if: steps.source.outputs.release_exists != 'true'
         working-directory: hermes-agent
         run: npm ci --workspace apps/desktop --include-workspace-root
 
       # v2026.9.24 imports lucide-react but omitted it from the Desktop
       # manifest. Pin the version used by the repaired upstream manifest.
       - name: Apply v2026.9.24 dependency hotfix
-        if: steps.source.outputs.release_exists != 'true' && steps.source.outputs.hermes_ref == 'v2026.9.24'
+        if: needs.resolve.outputs.hermes_ref == 'v2026.9.24'
         working-directory: hermes-agent
         run: |
           npm install --no-save --package-lock=false --ignore-scripts --workspaces=false lucide-react@0.577.0
           node -e 'console.log("Resolved hotfix dependency:", require.resolve("lucide-react", { paths: ["apps/desktop"] }))'
 
       - name: Build official Desktop app
-        if: steps.source.outputs.release_exists != 'true'
         working-directory: hermes-agent
         env:
           HERMES_SOURCE_SHA: ${{ steps.hermes_source.outputs.commit }}
-          HERMES_SOURCE_REF: ${{ steps.source.outputs.hermes_ref }}
+          HERMES_SOURCE_REF: ${{ needs.resolve.outputs.hermes_ref }}
         run: |
           set -euo pipefail
           GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" \
@@ -128,14 +159,12 @@ jobs:
       # loads them as ESM and require() fails. Only the toolset subdirectories
       # are recreated per run, so a package.json in their parent survives.
       - name: Load prepared packaging toolsets as CommonJS
-        if: steps.source.outputs.release_exists != 'true'
         working-directory: hermes-agent
         run: |
           mkdir -p apps/desktop/build/prepared-packaging-tools
           printf '{ "type": "commonjs" }\n' > apps/desktop/build/prepared-packaging-tools/package.json
 
       - name: Package only Linux x86-64 AppImage
-        if: steps.source.outputs.release_exists != 'true'
         working-directory: hermes-agent
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -146,11 +175,12 @@ jobs:
         run: npm run builder --workspace apps/desktop -- --linux AppImage
 
       - name: Verify and stage release files
-        if: steps.source.outputs.release_exists != 'true'
         shell: bash
         env:
           EXPECTED_HERMES_SHA: ${{ steps.hermes_source.outputs.commit }}
-          EXPECTED_HERMES_REF: ${{ steps.source.outputs.hermes_ref }}
+          EXPECTED_HERMES_REF: ${{ needs.resolve.outputs.hermes_ref }}
+          EXPECTED_PAYLOAD: ${{ matrix.payload }}
+          ASSET_NAME: ${{ matrix.name }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -163,57 +193,101 @@ jobs:
 
           mkdir -p stamp-check release-files
           (cd stamp-check && "../${appimages[0]}" --appimage-extract resources/install-stamp.json >/dev/null)
-          node -e 'const fs=require("node:fs");const p="stamp-check/squashfs-root/resources/install-stamp.json";const s=JSON.parse(fs.readFileSync(p,"utf8"));if(s.commit!==process.env.EXPECTED_HERMES_SHA){throw new Error(`Packaged stamp ${s.commit} does not match Hermes ${process.env.EXPECTED_HERMES_SHA}`)};if(s.branch!==process.env.EXPECTED_HERMES_REF){throw new Error(`Packaged ref ${s.branch} does not match Hermes ${process.env.EXPECTED_HERMES_REF}`)};console.log("Verified packaged install stamp:",JSON.stringify(s))'
+          node -e 'const fs=require("node:fs");const p="stamp-check/squashfs-root/resources/install-stamp.json";const s=JSON.parse(fs.readFileSync(p,"utf8"));if(s.commit!==process.env.EXPECTED_HERMES_SHA){throw new Error(`Packaged stamp ${s.commit} does not match Hermes ${process.env.EXPECTED_HERMES_SHA}`)};if(s.branch!==process.env.EXPECTED_HERMES_REF){throw new Error(`Packaged ref ${s.branch} does not match Hermes ${process.env.EXPECTED_HERMES_REF}`)};if(s.payload!==process.env.EXPECTED_PAYLOAD){throw new Error(`Packaged payload ${s.payload} is not the ${process.env.EXPECTED_PAYLOAD} variant`)};console.log("Verified packaged install stamp:",JSON.stringify(s))'
 
-          cp -- "${appimages[0]}" release-files/Hermes-Desktop-x86_64.AppImage
+          cp -- "${appimages[0]}" "release-files/$ASSET_NAME-x86_64.AppImage"
           cp -- stamp-check/squashfs-root/resources/install-stamp.json \
-            release-files/Hermes-Desktop-build-provenance.json
+            "release-files/$ASSET_NAME-build-provenance.json"
           (
             cd release-files
-            sha256sum Hermes-Desktop-x86_64.AppImage \
-              > Hermes-Desktop-x86_64.AppImage.sha256
-            sha256sum -c Hermes-Desktop-x86_64.AppImage.sha256
+            sha256sum "$ASSET_NAME-x86_64.AppImage" \
+              > "$ASSET_NAME-x86_64.AppImage.sha256"
+            sha256sum -c "$ASSET_NAME-x86_64.AppImage.sha256"
           )
 
+      - name: Hand release files to the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-files-${{ matrix.variant }}
+          path: release-files/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: [resolve, build]
+    # Publish whichever variants built; a failed one stays missing from the
+    # release and is retried by the next scheduled run.
+    if: ${{ !cancelled() && needs.resolve.outputs.matrix != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Collect release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-files-*
+          path: release-files
+          merge-multiple: true
+
       - name: Publish GitHub Release
-        if: steps.source.outputs.release_exists != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
-          HERMES_REF: ${{ steps.source.outputs.hermes_ref }}
-          HERMES_SHA: ${{ steps.hermes_source.outputs.commit }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_EXISTS: ${{ needs.resolve.outputs.release_exists }}
+          HERMES_REF: ${{ needs.resolve.outputs.hermes_ref }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          files=(release-files/*)
+          if (( ${#files[@]} == 0 )); then
+            printf 'No variant built; nothing to publish.\n' >&2
+            exit 1
+          fi
+          (cd release-files && sha256sum -c ./*.sha256)
+
+          hermes_sha="$(jq -r '.commit' release-files/*-build-provenance.json | sort -u)"
+          if [[ "$(wc -l <<<"$hermes_sha")" != 1 ]]; then
+            printf 'Variants were built from different commits:\n%s\n' "$hermes_sha" >&2
+            exit 1
+          fi
+
           notes_file="$(mktemp)"
           {
-            printf 'Unofficial downstream Linux x86-64 AppImage of Nous Research Hermes Desktop.\n\n'
+            printf 'Unofficial downstream Linux x86-64 AppImages of Nous Research Hermes Desktop.\n\n'
+            printf -- '- `Hermes-Desktop-x86_64.AppImage`: the full app, which can run a local agent.\n'
+            printf -- '- `Hermes-Light-x86_64.AppImage`: upstream'"'"'s remote-only Light client.\n\n'
             printf -- '- Upstream tag: `%s`\n' "$HERMES_REF"
-            printf -- '- Upstream commit: `%s`\n' "$HERMES_SHA"
+            printf -- '- Upstream commit: `%s`\n' "$hermes_sha"
             printf -- '- Build workflow: %s/%s/actions/runs/%s\n' \
               "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-            printf '\nThe workflow verified that the packaged install stamp matches the upstream commit before publishing. This repository is not affiliated with or endorsed by Nous Research.\n'
+            printf '\nThe workflow verified that each packaged install stamp matches the upstream commit before publishing. This repository is not affiliated with or endorsed by Nous Research.\n'
           } > "$notes_file"
 
-          gh release create "$RELEASE_TAG" \
-            release-files/Hermes-Desktop-x86_64.AppImage \
-            release-files/Hermes-Desktop-x86_64.AppImage.sha256 \
-            release-files/Hermes-Desktop-build-provenance.json \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Hermes Desktop AppImage — $HERMES_REF" \
-            --notes-file "$notes_file" \
-            --latest
+          if [[ "$RELEASE_EXISTS" == true ]]; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Hermes Desktop AppImage — $HERMES_REF" \
+              --notes-file "$notes_file" \
+              --latest
+          fi
 
       - name: Job summary
         env:
-          HERMES_REF: ${{ steps.source.outputs.hermes_ref }}
-          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
-          RELEASE_EXISTS: ${{ steps.source.outputs.release_exists }}
+          HERMES_REF: ${{ needs.resolve.outputs.hermes_ref }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_EXISTS: ${{ needs.resolve.outputs.release_exists }}
+          MATRIX: ${{ needs.resolve.outputs.matrix }}
         run: |
           {
             printf '### Hermes Desktop release channel\n\n'
             printf -- '- Upstream tag: `%s`\n' "$HERMES_REF"
             printf -- '- Downstream tag: `%s`\n' "$RELEASE_TAG"
-            printf -- '- Already existed: `%s`\n' "$RELEASE_EXISTS"
+            printf -- '- Release already existed: `%s`\n' "$RELEASE_EXISTS"
+            printf -- '- Variants attempted: `%s`\n' "$(jq -r 'map(.variant) | join(", ")' <<<"$MATRIX")"
           } >> "$GITHUB_STEP_SUMMARY"
