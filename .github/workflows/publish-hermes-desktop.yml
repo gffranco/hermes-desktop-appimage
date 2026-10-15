@@ -46,7 +46,9 @@ jobs:
             )"
           fi
 
-          if [[ ! "$hermes_ref" =~ ^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]]; then
+          # Upstream moved from date tags (v2026.9.24) to semver (v0.21.6) in
+          # October 2026; accept both, still rejecting pre-release suffixes.
+          if [[ ! "$hermes_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             printf 'Ref is not an official stable release tag: %s\n' "$hermes_ref" >&2
             exit 1
           fi
