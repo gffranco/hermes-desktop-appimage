@@ -8,6 +8,11 @@ on:
         required: false
         default: ""
         type: string
+      rebuild:
+        description: "Rebuild every variant and replace the release's existing files"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "42 11 * * *"
 
@@ -36,6 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_REF: ${{ inputs.hermes_ref }}
+          REBUILD: ${{ inputs.rebuild || false }}
         run: |
           set -euo pipefail
           requested="${REQUESTED_REF//[[:space:]]/}"
@@ -63,7 +69,9 @@ jobs:
           assets='[]'
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             release_exists=true
-            assets="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json assets -q '[.assets[].name]')"
+            if [[ "$REBUILD" != true ]]; then
+              assets="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json assets -q '[.assets[].name]')"
+            fi
           fi
 
           # The full app bootstraps a local agent; Light is upstream's
@@ -168,11 +176,21 @@ jobs:
         working-directory: hermes-agent
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          HERMES_REF: ${{ needs.resolve.outputs.hermes_ref }}
         # No --x64: with an explicit arch, upstream's wrapper (v0.21+) stages
         # into build/native-deps-linux-x64, which its own output guard rejects.
         # Without one it targets the runner's arch (x64) and reuses the
         # build/native-deps tree the build step already staged.
-        run: npm run builder --workspace apps/desktop -- --linux AppImage
+        #
+        # apps/desktop/package.json stays at 0.0.0 upstream, and electron-builder
+        # writes that into the desktop entry's X-AppImage-Version, which is what
+        # AppImage managers display; the wrapper admits a version override.
+        run: |
+          npm run builder --workspace apps/desktop -- --linux AppImage \
+            "-c.extraMetadata.version=${HERMES_REF#v}"
+
+      - name: Install zsyncmake
+        run: sudo apt-get install -y --no-install-recommends zsync
 
       - name: Verify and stage release files
         shell: bash
@@ -195,14 +213,43 @@ jobs:
           (cd stamp-check && "../${appimages[0]}" --appimage-extract resources/install-stamp.json >/dev/null)
           node -e 'const fs=require("node:fs");const p="stamp-check/squashfs-root/resources/install-stamp.json";const s=JSON.parse(fs.readFileSync(p,"utf8"));if(s.commit!==process.env.EXPECTED_HERMES_SHA){throw new Error(`Packaged stamp ${s.commit} does not match Hermes ${process.env.EXPECTED_HERMES_SHA}`)};if(s.branch!==process.env.EXPECTED_HERMES_REF){throw new Error(`Packaged ref ${s.branch} does not match Hermes ${process.env.EXPECTED_HERMES_REF}`)};if(s.payload!==process.env.EXPECTED_PAYLOAD){throw new Error(`Packaged payload ${s.payload} is not the ${process.env.EXPECTED_PAYLOAD} variant`)};console.log("Verified packaged install stamp:",JSON.stringify(s))'
 
-          cp -- "${appimages[0]}" "release-files/$ASSET_NAME-x86_64.AppImage"
+          (cd stamp-check && "../${appimages[0]}" --appimage-extract '*.desktop' >/dev/null)
+          desktop_version="$(sed -n 's/^X-AppImage-Version=//p' stamp-check/squashfs-root/*.desktop)"
+          if [[ "$desktop_version" != "${EXPECTED_HERMES_REF#v}" ]]; then
+            printf 'Desktop entry version %s is not %s\n' "$desktop_version" "${EXPECTED_HERMES_REF#v}" >&2
+            exit 1
+          fi
+
+          appimage="$ASSET_NAME-x86_64.AppImage"
+          cp -- "${appimages[0]}" "release-files/$appimage"
           cp -- stamp-check/squashfs-root/resources/install-stamp.json \
             "release-files/$ASSET_NAME-build-provenance.json"
+
+          # Embed AppImage update information so AppImage managers (Gear Lever,
+          # AppImageUpdate) find this repository's releases without manual
+          # setup. The runtime reserves an empty .upd_info section for it.
+          update_info="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|$appimage.zsync"
+          read -r section_offset section_size < <(
+            readelf -S --wide "release-files/$appimage" \
+              | sed -n 's/.*\.upd_info *PROGBITS *[0-9a-f]* *\([0-9a-f]*\) *\([0-9a-f]*\).*/\1 \2/p'
+          )
+          if [[ -z "${section_offset:-}" ]] || (( ${#update_info} >= 16#$section_size )); then
+            printf 'No .upd_info section large enough for: %s\n' "$update_info" >&2
+            exit 1
+          fi
+          printf '%s\0' "$update_info" \
+            | dd of="release-files/$appimage" bs=1 seek=$((16#$section_offset)) conv=notrunc status=none
+          if ! readelf --string-dump=.upd_info --wide "release-files/$appimage" | grep -qF "$update_info"; then
+            printf 'Embedded update information did not read back\n' >&2
+            exit 1
+          fi
+
           (
             cd release-files
-            sha256sum "$ASSET_NAME-x86_64.AppImage" \
-              > "$ASSET_NAME-x86_64.AppImage.sha256"
-            sha256sum -c "$ASSET_NAME-x86_64.AppImage.sha256"
+            # Gear Lever compares the SHA-1 in this header with the installed file.
+            zsyncmake -u "$appimage" -o "$appimage.zsync" "$appimage"
+            sha256sum "$appimage" > "$appimage.sha256"
+            sha256sum -c "$appimage.sha256"
           )
 
       - name: Hand release files to the publish job
@@ -266,7 +313,7 @@ jobs:
           } > "$notes_file"
 
           if [[ "$RELEASE_EXISTS" == true ]]; then
-            gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
           else
             gh release create "$RELEASE_TAG" "${files[@]}" \
