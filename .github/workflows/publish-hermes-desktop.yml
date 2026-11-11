@@ -131,23 +131,70 @@ jobs:
           printf 'Resolved commit: %s\n' "$commit"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
+      # v0.23.1 moved the JS workspace from npm to pnpm: package-lock.json is
+      # gone, and engines.npm plus engine-strict make npm refuse to install.
+      # Older tags still build with npm, so pick the manager per checkout.
+      - name: Detect Hermes package manager
+        id: pm
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          if [[ -f pnpm-lock.yaml ]]; then
+            printf 'manager=pnpm\n' >> "$GITHUB_OUTPUT"
+            printf 'pnpm_version=%s\n' "$(jq -er '.packages.pnpm.version' pm/lock.json)" >> "$GITHUB_OUTPUT"
+          elif [[ -f package-lock.json ]]; then
+            printf 'manager=npm\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'Neither pnpm-lock.yaml nor package-lock.json found\n' >&2
+            exit 1
+          fi
+
       - name: Set up Node.js required by Hermes
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # Upstream engines: v0.22.5 accepted ^22 || ^24 || >=26; v0.22.6+
           # require node >=26 (enforced via engine-strict in .npmrc).
           node-version: "26"
-          cache: npm
-          cache-dependency-path: hermes-agent/package-lock.json
+          cache: ${{ steps.pm.outputs.manager == 'npm' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.pm.outputs.manager == 'npm' && 'hermes-agent/package-lock.json' || '' }}
+          package-manager-cache: false
 
       # Upstream engines also require npm <11.10.0 || >=11.17.0; the bundled
       # npm on the runner is not guaranteed to satisfy that range, so pin it.
       - name: Align npm with upstream engine range
+        if: steps.pm.outputs.manager == 'npm'
         run: npm install -g npm@^11.17.0
+
+      # The root preinstall refuses any pnpm but the one pm/lock.json pins.
+      # Install that exact tarball after checking it against the lock's digest.
+      - name: Install pnpm pinned by Hermes
+        if: steps.pm.outputs.manager == 'pnpm'
+        working-directory: ${{ runner.temp }}
+        env:
+          PNPM_VERSION: ${{ steps.pm.outputs.pnpm_version }}
+          PM_LOCK: ${{ github.workspace }}/hermes-agent/pm/lock.json
+        run: |
+          set -euo pipefail
+          tarball="pnpm-$PNPM_VERSION.tgz"
+          url="https://registry.npmjs.org/pnpm/-/$tarball"
+          sha256="$(jq -er --arg url "$url" '[.packages.pnpm.artifacts[][] | select(.url == $url) | .sha256] | first' "$PM_LOCK")"
+          curl --fail --silent --show-error --location --retry 3 -o "$tarball" "$url"
+          printf '%s  %s\n' "$sha256" "$tarball" | sha256sum -c -
+          npm install -g "./$tarball"
+          pnpm --version
 
       - name: Install Desktop workspace dependencies
         working-directory: hermes-agent
-        run: npm ci --workspace apps/desktop --include-workspace-root
+        env:
+          PM: ${{ steps.pm.outputs.manager }}
+        run: |
+          set -euo pipefail
+          # The desktop build asserts a full root install under pnpm.
+          if [[ "$PM" == pnpm ]]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci --workspace apps/desktop --include-workspace-root
+          fi
 
       # v2026.9.24 imports lucide-react but omitted it from the Desktop
       # manifest. Pin the version used by the repaired upstream manifest.
@@ -163,10 +210,15 @@ jobs:
         env:
           HERMES_SOURCE_SHA: ${{ steps.hermes_source.outputs.commit }}
           HERMES_SOURCE_REF: ${{ needs.resolve.outputs.hermes_ref }}
+          PM: ${{ steps.pm.outputs.manager }}
         run: |
           set -euo pipefail
-          GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" \
-            npm run build --workspace apps/desktop
+          if [[ "$PM" == pnpm ]]; then
+            build=(pnpm --dir apps/desktop run build)
+          else
+            build=(npm run build --workspace apps/desktop)
+          fi
+          GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" "${build[@]}"
           node -e 'const fs=require("node:fs");const p="apps/desktop/build/install-stamp.json";const s=JSON.parse(fs.readFileSync(p,"utf8"));if(s.commit!==process.env.HERMES_SOURCE_SHA){throw new Error(`Install stamp ${s.commit} does not match Hermes ${process.env.HERMES_SOURCE_SHA}`)};console.log("Verified build-stage install stamp:",JSON.stringify(s))'
 
       # Upstream copies electron-builder's CommonJS toolsets (icon-tool.js)
@@ -184,6 +236,7 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           HERMES_REF: ${{ needs.resolve.outputs.hermes_ref }}
+          PM: ${{ steps.pm.outputs.manager }}
         # No --x64: with an explicit arch, upstream's wrapper (v0.21+) stages
         # into build/native-deps-linux-x64, which its own output guard rejects.
         # Without one it targets the runner's arch (x64) and reuses the
@@ -192,9 +245,16 @@ jobs:
         # apps/desktop/package.json stays at 0.0.0 upstream, and electron-builder
         # writes that into the desktop entry's X-AppImage-Version, which is what
         # AppImage managers display; the wrapper admits a version override.
+        #
+        # pnpm forwards arguments after the script name as-is, so no "--".
         run: |
-          npm run builder --workspace apps/desktop -- --linux AppImage \
-            "-c.extraMetadata.version=${HERMES_REF#v}"
+          set -euo pipefail
+          args=(--linux AppImage "-c.extraMetadata.version=${HERMES_REF#v}")
+          if [[ "$PM" == pnpm ]]; then
+            pnpm --dir apps/desktop run builder "${args[@]}"
+          else
+            npm run builder --workspace apps/desktop -- "${args[@]}"
+          fi
 
       - name: Install zsyncmake
         run: sudo apt-get install -y --no-install-recommends zsync
