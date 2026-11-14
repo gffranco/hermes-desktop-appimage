@@ -48,13 +48,9 @@ jobs:
           if [[ -n "$requested" ]]; then
             hermes_ref="$requested"
           else
-            hermes_ref="$(
-              curl --fail --silent --show-error --location --retry 3 \
-                -H "Accept: application/vnd.github+json" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                https://api.github.com/repos/NousResearch/hermes-agent/releases/latest \
-                | jq -er '.tag_name'
-            )"
+            # Authenticated: anonymous API calls share the runner IP's 60/hour
+            # limit and intermittently fail with 403.
+            hermes_ref="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq '.tag_name')"
           fi
 
           # Upstream moved from date tags (v2026.9.24) to semver (v0.21.6) in
@@ -332,7 +328,8 @@ jobs:
     needs: [resolve, build]
     # Publish whichever variants built; a failed one stays missing from the
     # release and is retried by the next scheduled run.
-    if: ${{ !cancelled() && needs.resolve.outputs.matrix != '[]' }}
+    # A failed resolve leaves matrix empty, which would pass the '[]' check.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.resolve.outputs.matrix != '[]' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
